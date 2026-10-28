@@ -1,0 +1,1092 @@
+---
+title: "NHANES Week 5–6 Lab Report"
+subtitle: "Data Cleaning, Visualization, Repeated Measurements, and BP Classification"
+author: "Student"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "90%"
+)
+```
+
+# Introduction
+
+This report uses the NHANES August 2021–August 2023 datasets to practice data cleaning, wrangling, visualization, and analysis of repeated blood-pressure measurements. The analysis is restricted to adults aged 20 years and older.
+
+Week 5 examines BMI and blood pressure cleaning, missingness, and the visual association between cleaned BMI and mean systolic blood pressure (SBP), stratified by sex. Week 6 examines repeated blood-pressure readings, within-person variability, and whether BP classification changes when the mean of repeated readings is used instead of Trial 1 alone.
+
+The outlier rules used in this lab are data-cleaning rules for identifying *potential* outliers; a flagged value is not necessarily an erroneous measurement.
+
+# 1. Setup and import data
+
+## 1.1 Packages and file paths
+
+```{r packages}
+pkgs <- c("tidyverse", "haven", "janitor", "stringr", "scales", "knitr")
+
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install) > 0) install.packages(to_install)
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# EDIT THIS PATH if your files are stored in a different folder.
+data_dir <- "C:/Users/jef81/Desktop/Health_Big_Data"
+
+dir.create("outputs", showWarnings = FALSE, recursive = TRUE)
+
+getwd()
+list.files(data_dir)
+```
+
+## 1.2 Read the NHANES files
+
+```{r import-data}
+demo <- read_xpt(file.path(data_dir, "DEMO_L.XPT")) %>%
+  clean_names()
+
+bmx <- read_xpt(file.path(data_dir, "BMX_L.XPT")) %>%
+  clean_names()
+
+bpx <- read_xpt(file.path(data_dir, "BPXO_L.XPT")) %>%
+  clean_names()
+
+glimpse(demo)
+glimpse(bmx)
+glimpse(bpx)
+
+stopifnot(!anyDuplicated(demo$seqn))
+stopifnot(!anyDuplicated(bmx$seqn))
+stopifnot(!anyDuplicated(bpx$seqn))
+```
+
+## 1.3 Restrict to adults and recode sex
+
+```{r adult-data}
+demo_adult <- demo %>%
+  transmute(
+    seqn,
+    age = ridageyr,
+    sex = factor(
+      riagendr,
+      levels = c(1, 2),
+      labels = c("Male", "Female")
+    )
+  ) %>%
+  filter(age >= 20)
+
+nrow(demo_adult)
+count(demo_adult, sex)
+```
+
+# 2. Week 5 Part A: BMI cleaning and visualization
+
+## 2.1 Create the raw BMI dataset
+
+```{r bmi-raw}
+bmi_raw <- bmx %>%
+  transmute(
+    seqn,
+    bmi_raw = bmxbmi
+  )
+
+dat_bmi_raw <- demo_adult %>%
+  left_join(bmi_raw, by = "seqn")
+
+miss_bmi_before <- dat_bmi_raw %>%
+  summarise(
+    n = n(),
+    bmi_missing = sum(is.na(bmi_raw)),
+    p_missing = bmi_missing / n
+  )
+
+miss_bmi_before
+summary(dat_bmi_raw$bmi_raw)
+```
+
+## 2.2 BMI boxplot before cleaning
+
+```{r bmi-before-plot, fig.width=6, fig.height=5}
+p_bmi_before <- ggplot(dat_bmi_raw, aes(x = "", y = bmi_raw)) +
+  geom_boxplot(
+    width = 0.35,
+    outlier.alpha = 0.30,
+    outlier.size = 1.6,
+    na.rm = TRUE
+  ) +
+  labs(
+    title = "BMI Before Cleaning",
+    subtitle = "Adults aged 20 years and older",
+    x = NULL,
+    y = expression(BMI~(kg/m^2))
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+p_bmi_before
+ggsave("outputs/week5_bmi_before.png", p_bmi_before,
+       width = 6, height = 5, bg = "white")
+```
+
+## 2.3 Clean BMI using the range, IQR, and MAD rules
+
+A BMI value is flagged if any of the following applies:
+
+- BMI is below 10 or above 80.
+- BMI is outside the 1.5 × IQR fences.
+- The absolute MAD-based robust z-score exceeds 3.5.
+
+The robust z-score is calculated as:
+
+\[
+z_{\mathrm{robust}} = \frac{|x-\mathrm{median}(x)|}{1.4826 \times MAD}
+\]
+
+Here `mad(..., constant = 1)` returns the unscaled MAD used in this formula.
+
+```{r bmi-cleaning}
+BMI_LO <- 10
+BMI_HI <- 80
+
+bmi_x <- bmx$bmxbmi
+
+# Rule 1: physiologic bounds
+bmi_range_flag <- bmi_x < BMI_LO | bmi_x > BMI_HI
+
+# Rule 2: IQR fences
+bmi_q <- quantile(
+  bmi_x,
+  probs = c(0.25, 0.75),
+  na.rm = TRUE,
+  names = FALSE
+)
+bmi_iqr <- bmi_q[2] - bmi_q[1]
+bmi_lo_iqr <- bmi_q[1] - 1.5 * bmi_iqr
+bmi_hi_iqr <- bmi_q[2] + 1.5 * bmi_iqr
+bmi_iqr_flag <- bmi_x < bmi_lo_iqr | bmi_x > bmi_hi_iqr
+
+# Rule 3: MAD-based robust z-score
+bmi_med <- median(bmi_x, na.rm = TRUE)
+bmi_mad_raw <- mad(
+  bmi_x,
+  center = bmi_med,
+  constant = 1,
+  na.rm = TRUE
+)
+
+if (is.na(bmi_mad_raw) || bmi_mad_raw == 0) {
+  bmi_mad_flag <- rep(FALSE, length(bmi_x))
+} else {
+  bmi_robust_z <- abs(bmi_x - bmi_med) / (1.4826 * bmi_mad_raw)
+  bmi_mad_flag <- bmi_robust_z > 3.5
+}
+
+bmi_flag <- !is.na(bmi_x) &
+  (bmi_range_flag | bmi_iqr_flag | bmi_mad_flag)
+
+bmi_clean <- bmx %>%
+  transmute(
+    seqn,
+    bmi_raw = bmxbmi,
+    bmi_flag = bmi_flag,
+    bmi_clean = if_else(bmi_flag, NA_real_, bmi_raw)
+  )
+
+dat_bmi <- demo_adult %>%
+  left_join(bmi_clean, by = "seqn")
+
+tibble(
+  n_flagged = sum(bmi_clean$bmi_flag, na.rm = TRUE),
+  iqr_lower = bmi_lo_iqr,
+  iqr_upper = bmi_hi_iqr,
+  median_bmi = bmi_med,
+  unscaled_mad = bmi_mad_raw
+)
+```
+
+## 2.4 BMI boxplot after cleaning
+
+```{r bmi-after-plot, fig.width=6, fig.height=5}
+p_bmi_after <- ggplot(dat_bmi, aes(x = "", y = bmi_clean)) +
+  geom_boxplot(
+    width = 0.35,
+    outlier.alpha = 0.30,
+    outlier.size = 1.6,
+    na.rm = TRUE
+  ) +
+  labs(
+    title = "BMI After Cleaning",
+    subtitle = "Adults aged 20 years and older",
+    x = NULL,
+    y = expression(BMI~(kg/m^2))
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+p_bmi_after
+ggsave("outputs/week5_bmi_after.png", p_bmi_after,
+       width = 6, height = 5, bg = "white")
+```
+
+## 2.5 Compare BMI missingness before and after cleaning
+
+```{r bmi-missingness}
+miss_bmi <- bind_rows(
+  tibble(
+    stage = "Before",
+    variable = "BMI",
+    n_missing = sum(is.na(dat_bmi$bmi_raw)),
+    n_total = nrow(dat_bmi)
+  ),
+  tibble(
+    stage = "After",
+    variable = "BMI",
+    n_missing = sum(is.na(dat_bmi$bmi_clean)),
+    n_total = nrow(dat_bmi)
+  )
+) %>%
+  mutate(
+    p_missing = n_missing / n_total,
+    stage = factor(stage, levels = c("Before", "After"))
+  )
+
+knitr::kable(miss_bmi, digits = 3,
+             caption = "BMI missingness before and after cleaning")
+
+p_miss_bmi <- ggplot(
+  miss_bmi,
+  aes(x = variable, y = p_missing, fill = stage)
+) +
+  geom_col(width = 0.6, position = position_dodge(width = 0.75)) +
+  geom_text(
+    aes(label = paste0(
+      percent(p_missing, accuracy = 0.1),
+      "\n(", n_missing, "/", n_total, ")"
+    )),
+    position = position_dodge(width = 0.75),
+    vjust = -0.2,
+    size = 3.4
+  ) +
+  scale_y_continuous(
+    labels = percent,
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "BMI Missingness Before vs After Cleaning",
+    x = NULL,
+    y = "Missing proportion",
+    fill = "Stage"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_miss_bmi
+ggsave("outputs/week5_bmi_missingness.png", p_miss_bmi,
+       width = 6, height = 5, bg = "white")
+```
+
+# 3. Week 5 Part B: Blood pressure cleaning
+
+## 3.1 Identify the repeated SBP and DBP readings
+
+```{r identify-bp}
+sbp_cols <- names(bpx)[str_detect(names(bpx), "^bpxosy[1-3]$")]
+dbp_cols <- names(bpx)[str_detect(names(bpx), "^bpxodi[1-3]$")]
+
+sbp_cols
+dbp_cols
+
+stopifnot(length(sbp_cols) == 3)
+stopifnot(length(dbp_cols) == 3)
+```
+
+## 3.2 Calculate raw mean SBP
+
+The raw participant-level mean SBP is calculated from all available original SBP readings. If all three readings are missing, the mean remains missing.
+
+```{r raw-mean-sbp}
+bp_raw <- bpx %>%
+  transmute(
+    seqn,
+    sbp_raw_mean = if_else(
+      rowSums(!is.na(as.matrix(select(., all_of(sbp_cols))))) > 0,
+      rowMeans(as.matrix(select(., all_of(sbp_cols))), na.rm = TRUE),
+      NA_real_
+    )
+  )
+
+summary(bp_raw$sbp_raw_mean)
+```
+
+## 3.3 Define a reusable cleaning function
+
+Each SBP and DBP reading is cleaned individually before calculating cleaned participant-level means.
+
+```{r bp-clean-function}
+clean_measurement <- function(x, lower, upper) {
+  # Rule 1: physiologic bounds
+  range_flag <- x < lower | x > upper
+
+  # Rule 2: IQR fences
+  q <- quantile(
+    x,
+    probs = c(0.25, 0.75),
+    na.rm = TRUE,
+    names = FALSE
+  )
+  iqr_value <- q[2] - q[1]
+  iqr_lower <- q[1] - 1.5 * iqr_value
+  iqr_upper <- q[2] + 1.5 * iqr_value
+  iqr_flag <- x < iqr_lower | x > iqr_upper
+
+  # Rule 3: MAD robust z-score
+  med <- median(x, na.rm = TRUE)
+  mad_raw <- mad(x, center = med, constant = 1, na.rm = TRUE)
+
+  if (is.na(mad_raw) || mad_raw == 0) {
+    mad_flag <- rep(FALSE, length(x))
+  } else {
+    robust_z <- abs(x - med) / (1.4826 * mad_raw)
+    mad_flag <- robust_z > 3.5
+  }
+
+  flag <- !is.na(x) & (range_flag | iqr_flag | mad_flag)
+  if_else(flag, NA_real_, x)
+}
+```
+
+## 3.4 Clean each reading and calculate cleaned means
+
+Physiologic bounds are SBP 70–260 mmHg and DBP 40–150 mmHg.
+
+```{r bp-clean}
+bp_clean <- bpx %>%
+  select(seqn, all_of(sbp_cols), all_of(dbp_cols)) %>%
+  mutate(
+    across(
+      all_of(sbp_cols),
+      ~ clean_measurement(.x, lower = 70, upper = 260),
+      .names = "{.col}_clean"
+    ),
+    across(
+      all_of(dbp_cols),
+      ~ clean_measurement(.x, lower = 40, upper = 150),
+      .names = "{.col}_clean"
+    )
+  )
+
+sbp_clean_cols <- paste0(sbp_cols, "_clean")
+dbp_clean_cols <- paste0(dbp_cols, "_clean")
+
+bp_clean <- bp_clean %>%
+  mutate(
+    sbp_clean_mean = if_else(
+      rowSums(!is.na(as.matrix(select(., all_of(sbp_clean_cols))))) > 0,
+      rowMeans(as.matrix(select(., all_of(sbp_clean_cols))), na.rm = TRUE),
+      NA_real_
+    ),
+    dbp_clean_mean = if_else(
+      rowSums(!is.na(as.matrix(select(., all_of(dbp_clean_cols))))) > 0,
+      rowMeans(as.matrix(select(., all_of(dbp_clean_cols))), na.rm = TRUE),
+      NA_real_
+    )
+  )
+
+summary(bp_clean$sbp_clean_mean)
+summary(bp_clean$dbp_clean_mean)
+```
+
+## 3.5 Build the final adult analysis dataset
+
+```{r final-week5-dataset}
+bp_analysis <- bp_clean %>%
+  select(seqn, sbp_clean_mean, dbp_clean_mean) %>%
+  left_join(
+    bp_raw %>% select(seqn, sbp_raw_mean),
+    by = "seqn"
+  ) %>%
+  select(seqn, sbp_raw_mean, sbp_clean_mean, dbp_clean_mean)
+
+dat_final <- dat_bmi %>%
+  left_join(bp_analysis, by = "seqn")
+
+stopifnot(!anyDuplicated(dat_final$seqn))
+
+glimpse(dat_final)
+```
+
+## 3.6 Mean SBP boxplot before and after cleaning
+
+```{r sbp-before-after-plot, fig.width=7, fig.height=5}
+sbp_box_data <- dat_final %>%
+  select(sbp_raw_mean, sbp_clean_mean) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "stage",
+    values_to = "mean_sbp"
+  ) %>%
+  mutate(
+    stage = recode(
+      stage,
+      sbp_raw_mean = "Before cleaning",
+      sbp_clean_mean = "After cleaning"
+    ),
+    stage = factor(stage, levels = c("Before cleaning", "After cleaning"))
+  )
+
+p_sbp_box <- ggplot(sbp_box_data, aes(x = stage, y = mean_sbp)) +
+  geom_boxplot(outlier.alpha = 0.25, na.rm = TRUE) +
+  labs(
+    title = "Mean SBP Before and After Cleaning",
+    x = NULL,
+    y = "Mean systolic blood pressure (mmHg)"
+  ) +
+  theme_minimal(base_size = 13)
+
+p_sbp_box
+ggsave("outputs/week5_sbp_before_after.png", p_sbp_box,
+       width = 7, height = 5, bg = "white")
+```
+
+## 3.7 Compare BMI and mean SBP missingness
+
+```{r bmi-sbp-missingness}
+miss_compare <- bind_rows(
+  tibble(
+    stage = "Before",
+    variable = "BMI",
+    n_missing = sum(is.na(dat_final$bmi_raw)),
+    n_total = nrow(dat_final)
+  ),
+  tibble(
+    stage = "After",
+    variable = "BMI",
+    n_missing = sum(is.na(dat_final$bmi_clean)),
+    n_total = nrow(dat_final)
+  ),
+  tibble(
+    stage = "Before",
+    variable = "Mean SBP",
+    n_missing = sum(is.na(dat_final$sbp_raw_mean)),
+    n_total = nrow(dat_final)
+  ),
+  tibble(
+    stage = "After",
+    variable = "Mean SBP",
+    n_missing = sum(is.na(dat_final$sbp_clean_mean)),
+    n_total = nrow(dat_final)
+  )
+) %>%
+  mutate(
+    p_missing = n_missing / n_total,
+    stage = factor(stage, levels = c("Before", "After")),
+    variable = factor(variable, levels = c("BMI", "Mean SBP"))
+  )
+
+knitr::kable(miss_compare, digits = 3,
+             caption = "Missingness before and after cleaning")
+
+p_miss_compare <- ggplot(
+  miss_compare,
+  aes(x = variable, y = p_missing, fill = stage)
+) +
+  geom_col(width = 0.6, position = position_dodge(width = 0.75)) +
+  geom_text(
+    aes(label = paste0(
+      percent(p_missing, accuracy = 0.1),
+      "\n(", n_missing, "/", n_total, ")"
+    )),
+    position = position_dodge(width = 0.75),
+    vjust = -0.2,
+    size = 3.2
+  ) +
+  scale_y_continuous(
+    labels = percent,
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "BMI and Mean SBP Missingness Before vs After Cleaning",
+    x = NULL,
+    y = "Missing proportion",
+    fill = "Stage"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_miss_compare
+ggsave("outputs/week5_bmi_sbp_missingness.png", p_miss_compare,
+       width = 7, height = 5, bg = "white")
+```
+
+## 3.8 Scatter plot of cleaned BMI and mean SBP by sex
+
+```{r bmi-sbp-scatter, fig.width=8, fig.height=6}
+p_bmi_sbp <- ggplot(
+  dat_final,
+  aes(x = bmi_clean, y = sbp_clean_mean, color = sex)
+) +
+  geom_point(alpha = 0.3, size = 1.3, na.rm = TRUE) +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    se = FALSE,
+    linewidth = 1,
+    na.rm = TRUE
+  ) +
+  labs(
+    title = "BMI and Mean SBP by Sex",
+    subtitle = "Adults aged 20 years and older, NHANES 2021–2023",
+    x = expression(BMI~(kg/m^2)),
+    y = "Cleaned mean SBP (mmHg)",
+    color = "Sex"
+  ) +
+  theme_minimal(base_size = 13)
+
+p_bmi_sbp
+ggsave("outputs/week5_bmi_sbp_scatter_by_sex.png", p_bmi_sbp,
+       width = 8, height = 6, bg = "white")
+```
+
+### Week 5 descriptive conclusion
+
+Complete this paragraph after inspecting the scatter plot:
+
+> Among adults aged 20 years and older, the scatter plot suggests a weak association between BMI and mean SBP. The visual pattern appears different between males and females, with SBP level. These findings are descriptive and do not establish a causal relationship.
+
+# 4. Week 6 Part A: Repeated BP measurements
+
+## 4.1 Identify raw BP columns and reshape to long format
+
+```{r week6-raw-long}
+stopifnot(exists("bpx"), exists("demo_adult"))
+stopifnot(!anyDuplicated(bpx$seqn))
+
+sbp_raw_cols <- names(bpx)[str_detect(names(bpx), "^bpxo?sy[1-3]$")]
+dbp_raw_cols <- names(bpx)[str_detect(names(bpx), "^bpxo?di[1-3]$")]
+
+sbp_raw_cols
+dbp_raw_cols
+
+stopifnot(length(sbp_raw_cols) == 3)
+stopifnot(length(dbp_raw_cols) == 3)
+
+bp_long_raw <- bpx %>%
+  semi_join(demo_adult %>% select(seqn), by = "seqn") %>%
+  select(seqn, all_of(c(sbp_raw_cols, dbp_raw_cols))) %>%
+  pivot_longer(
+    cols = -seqn,
+    names_to = c("measure", "trial"),
+    names_pattern = "^bpxo?(sy|di)([1-3])$",
+    values_to = "value"
+  ) %>%
+  mutate(
+    measure = recode(measure, sy = "SBP", di = "DBP"),
+    trial = as.integer(trial),
+    trial_f = factor(
+      trial,
+      levels = 1:3,
+      labels = c("Trial 1", "Trial 2", "Trial 3")
+    )
+  )
+
+glimpse(bp_long_raw)
+```
+
+## 4.2 Summarize raw SBP and DBP across trials
+
+```{r raw-trial-summary}
+trial_summary <- bp_long_raw %>%
+  group_by(measure, trial_f) %>%
+  summarise(
+    n_nonmissing = sum(!is.na(value)),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    q1 = quantile(value, 0.25, na.rm = TRUE),
+    q3 = quantile(value, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(trial_summary, digits = 1,
+             caption = "Raw BP summary across Trials 1–3")
+```
+
+## 4.3 Raw BP boxplots across repeated trials
+
+```{r raw-trial-boxplots, fig.width=8, fig.height=5}
+p_trial <- ggplot(
+  bp_long_raw,
+  aes(x = trial_f, y = value, fill = trial_f)
+) +
+  geom_boxplot(outlier.alpha = 0.15, na.rm = TRUE) +
+  facet_wrap(~ measure, scales = "free_y") +
+  labs(
+    title = "Raw Blood Pressure Across Repeated Trials",
+    x = "Measurement trial",
+    y = "Blood pressure (mmHg)",
+    fill = "Trial"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+p_trial
+ggsave("outputs/week6_raw_bp_trial_boxplots.png", p_trial,
+       width = 8, height = 5, bg = "white")
+```
+
+## 4.4 Within-person SBP change from Trial 1 to Trial 3
+
+```{r sbp-change}
+sbp_change <- bp_long_raw %>%
+  filter(measure == "SBP") %>%
+  select(seqn, trial, value) %>%
+  mutate(trial = paste0("trial", trial)) %>%
+  pivot_wider(names_from = trial, values_from = value) %>%
+  mutate(
+    delta_31 = trial3 - trial1,
+    change_direction = case_when(
+      is.na(delta_31) ~ NA_character_,
+      delta_31 < 0 ~ "Trial 3 lower",
+      delta_31 > 0 ~ "Trial 3 higher",
+      TRUE ~ "No change"
+    )
+  )
+
+sbp_change_summary <- sbp_change %>%
+  summarise(
+    n_with_change = sum(!is.na(delta_31)),
+    mean_change = mean(delta_31, na.rm = TRUE),
+    median_change = median(delta_31, na.rm = TRUE),
+    sd_change = sd(delta_31, na.rm = TRUE)
+  )
+
+knitr::kable(sbp_change_summary, digits = 2,
+             caption = "Raw SBP change: Trial 3 minus Trial 1")
+
+knitr::kable(count(sbp_change, change_direction),
+             caption = "Direction of raw SBP change")
+```
+
+```{r sbp-change-histogram, fig.width=7, fig.height=5}
+p_change <- sbp_change %>%
+  filter(!is.na(delta_31)) %>%
+  ggplot(aes(x = delta_31)) +
+  geom_histogram(
+    binwidth = 2,
+    boundary = 0,
+    color = "white"
+  ) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(
+    title = "Within-Person Change in SBP: Trial 3 - Trial 1",
+    x = "SBP change (mmHg)",
+    y = "Number of participants"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_change
+ggsave("outputs/week6_raw_sbp_change_histogram.png", p_change,
+       width = 7, height = 5, bg = "white")
+```
+
+## 4.5 Spaghetti plot for up to 60 participants
+
+```{r sbp-spaghetti, fig.width=8, fig.height=5}
+complete_ids <- sbp_change %>%
+  filter(!is.na(trial1), !is.na(trial2), !is.na(trial3)) %>%
+  arrange(seqn) %>%
+  slice_head(n = 60) %>%
+  pull(seqn)
+
+p_lines <- bp_long_raw %>%
+  filter(measure == "SBP", seqn %in% complete_ids) %>%
+  ggplot(aes(x = trial, y = value, group = factor(seqn))) +
+  geom_line(alpha = 0.25, na.rm = TRUE) +
+  geom_point(alpha = 0.35, size = 1, na.rm = TRUE) +
+  scale_x_continuous(breaks = 1:3) +
+  labs(
+    title = "Repeated SBP Readings for Up to 60 Participants",
+    x = "Trial",
+    y = "SBP (mmHg)"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_lines
+ggsave("outputs/week6_raw_sbp_spaghetti.png", p_lines,
+       width = 8, height = 5, bg = "white")
+```
+
+## 4.6 Quantify within-person variability
+
+```{r within-person-variability}
+bp_within <- bp_long_raw %>%
+  group_by(seqn, measure) %>%
+  summarise(
+    n_readings = sum(!is.na(value)),
+    mean_bp = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+    range_bp = if (sum(!is.na(value)) >= 2) {
+      max(value, na.rm = TRUE) - min(value, na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    sd_bp = if (sum(!is.na(value)) >= 2) sd(value, na.rm = TRUE) else NA_real_,
+    .groups = "drop"
+  )
+
+within_summary <- bp_within %>%
+  filter(n_readings >= 2) %>%
+  group_by(measure) %>%
+  summarise(
+    n_participants = n(),
+    median_range = median(range_bp, na.rm = TRUE),
+    p90_range = quantile(range_bp, 0.90, na.rm = TRUE),
+    median_sd = median(sd_bp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(within_summary, digits = 1,
+             caption = "Within-person variability in raw BP readings")
+```
+
+### Week 6 Part A discussion
+
+Use the three-trial boxplots, Trial 3 minus Trial 1 histogram, spaghetti plot, and within-person variability table to discuss whether the population distributions appear stable and whether individual participants nevertheless show variation. Similar distributions across trials do not imply that each participant has identical readings.
+
+# 5. Week 6 Part B: Does the measurement strategy change BP classification?
+
+This section uses the cleaned repeated readings created in Week 5. BP categories follow the exercise's specified thresholds. When SBP and DBP fall into different categories, the higher category is assigned.
+
+## 5.1 Reshape cleaned repeated readings
+
+```{r cleaned-long}
+sbp_clean_cols <- paste0(sbp_raw_cols, "_clean")
+dbp_clean_cols <- paste0(dbp_raw_cols, "_clean")
+
+stopifnot(all(sbp_clean_cols %in% names(bp_clean)))
+stopifnot(all(dbp_clean_cols %in% names(bp_clean)))
+
+bp_long_clean <- bp_clean %>%
+  semi_join(demo_adult %>% select(seqn), by = "seqn") %>%
+  select(seqn, all_of(c(sbp_clean_cols, dbp_clean_cols))) %>%
+  pivot_longer(
+    cols = -seqn,
+    names_to = c("measure", "trial"),
+    names_pattern = "^bpxo?(sy|di)([1-3])_clean$",
+    values_to = "value"
+  ) %>%
+  mutate(
+    measure = recode(measure, sy = "SBP", di = "DBP"),
+    trial = as.integer(trial),
+    trial_f = factor(
+      trial,
+      levels = 1:3,
+      labels = c("Trial 1", "Trial 2", "Trial 3")
+    )
+  )
+
+glimpse(bp_long_clean)
+```
+
+## 5.2 Create participant-level Trial 1, mean, median, and variability summaries
+
+```{r cleaned-person-summary}
+bp_person <- bp_long_clean %>%
+  group_by(seqn, measure) %>%
+  summarise(
+    trial1 = if (all(is.na(value[trial == 1]))) {
+      NA_real_
+    } else {
+      value[trial == 1][!is.na(value[trial == 1])][1]
+    },
+    mean_bp = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+    median_bp = if (all(is.na(value))) NA_real_ else median(value, na.rm = TRUE),
+    n_readings = sum(!is.na(value)),
+    range_bp = if (sum(!is.na(value)) >= 2) {
+      max(value, na.rm = TRUE) - min(value, na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    sd_bp = if (sum(!is.na(value)) >= 2) sd(value, na.rm = TRUE) else NA_real_,
+    .groups = "drop"
+  )
+
+bp_person_wide <- bp_person %>%
+  pivot_wider(
+    names_from = measure,
+    values_from = c(
+      trial1, mean_bp, median_bp,
+      n_readings, range_bp, sd_bp
+    ),
+    names_glue = "{measure}_{.value}"
+  )
+
+bp_class_data <- bp_person_wide %>%
+  transmute(
+    seqn,
+    sbp_trial1 = SBP_trial1,
+    dbp_trial1 = DBP_trial1,
+    sbp_mean = SBP_mean_bp,
+    dbp_mean = DBP_mean_bp,
+    sbp_median = SBP_median_bp,
+    dbp_median = DBP_median_bp,
+    sbp_range = SBP_range_bp,
+    sbp_sd = SBP_sd_bp,
+    dbp_range = DBP_range_bp,
+    dbp_sd = DBP_sd_bp,
+    sbp_n = SBP_n_readings,
+    dbp_n = DBP_n_readings
+  )
+
+glimpse(bp_class_data)
+```
+
+## 5.3 Define BP categories
+
+```{r bp-categories}
+classify_bp <- function(sbp, dbp) {
+  case_when(
+    is.na(sbp) | is.na(dbp) ~ NA_character_,
+    sbp >= 140 | dbp >= 90 ~ "Stage 2",
+    sbp >= 130 | dbp >= 80 ~ "Stage 1",
+    sbp >= 120 & sbp < 130 & dbp < 80 ~ "Elevated",
+    sbp < 120 & dbp < 80 ~ "Normal",
+    TRUE ~ NA_character_
+  )
+}
+
+bp_class_data <- bp_class_data %>%
+  mutate(
+    category_trial1 = classify_bp(sbp_trial1, dbp_trial1),
+    category_mean = classify_bp(sbp_mean, dbp_mean),
+    category_median = classify_bp(sbp_median, dbp_median)
+  )
+
+category_levels <- c("Normal", "Elevated", "Stage 1", "Stage 2")
+
+bp_class_data <- bp_class_data %>%
+  mutate(
+    category_trial1 = factor(category_trial1, levels = category_levels),
+    category_mean = factor(category_mean, levels = category_levels),
+    category_median = factor(category_median, levels = category_levels)
+  )
+
+knitr::kable(
+  bp_class_data %>% count(category_trial1),
+  caption = "Classification using Trial 1"
+)
+
+knitr::kable(
+  bp_class_data %>% count(category_mean),
+  caption = "Classification using mean of repeated readings"
+)
+```
+
+## 5.4 Trial 1 versus mean classification table and reclassification proportion
+
+```{r reclassification}
+bp_reclass <- bp_class_data %>%
+  filter(!is.na(category_trial1), !is.na(category_mean)) %>%
+  mutate(reclassified = category_trial1 != category_mean)
+
+class_table <- bp_reclass %>%
+  count(category_trial1, category_mean, name = "n") %>%
+  pivot_wider(
+    names_from = category_mean,
+    values_from = n,
+    values_fill = 0,
+    names_prefix = "Mean_"
+  )
+
+knitr::kable(
+  class_table,
+  caption = "Cross-tabulation: Trial 1 classification versus mean classification"
+)
+
+reclass_summary <- bp_reclass %>%
+  summarise(
+    n_total = n(),
+    n_reclassified = sum(reclassified),
+    reclass_prop = mean(reclassified),
+    reclass_percent = 100 * mean(reclassified)
+  )
+
+knitr::kable(
+  reclass_summary,
+  digits = 2,
+  caption = "Overall BP reclassification when using mean instead of Trial 1"
+)
+```
+
+## 5.5 Classification heatmap
+
+Cells on the diagonal indicate no category change; off-diagonal cells indicate reclassification.
+
+```{r classification-heatmap, fig.width=7, fig.height=6}
+heatmap_data <- bp_reclass %>%
+  count(category_trial1, category_mean, name = "n")
+
+p_heatmap <- ggplot(
+  heatmap_data,
+  aes(x = category_trial1, y = category_mean, fill = n)
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), size = 4) +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_discrete(drop = FALSE) +
+  labs(
+    title = "BP Classification: Trial 1 vs Mean",
+    x = "Classification using Trial 1",
+    y = "Classification using mean BP",
+    fill = "Participants"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+p_heatmap
+ggsave("outputs/week6_bp_classification_heatmap.png", p_heatmap,
+       width = 7, height = 6, bg = "white")
+```
+
+## 5.6 Reclassification by within-person SBP variability
+
+```{r variability-reclassification}
+bp_variability <- bp_class_data %>%
+  filter(
+    !is.na(category_trial1),
+    !is.na(category_mean),
+    !is.na(sbp_sd)
+  ) %>%
+  mutate(
+    variability_group = factor(
+      ntile(sbp_sd, 3),
+      levels = 1:3,
+      labels = c("Low", "Middle", "High")
+    ),
+    reclassified = category_trial1 != category_mean
+  )
+
+variability_summary <- bp_variability %>%
+  group_by(variability_group) %>%
+  summarise(
+    n = n(),
+    n_reclassified = sum(reclassified),
+    reclass_prop = mean(reclassified),
+    reclass_percent = 100 * reclass_prop,
+    median_sbp_sd = median(sbp_sd, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  variability_summary,
+  digits = 2,
+  caption = "Reclassification rate by within-person SBP variability"
+)
+```
+
+```{r variability-plot, fig.width=7, fig.height=5}
+p_variability <- ggplot(
+  variability_summary,
+  aes(x = variability_group, y = reclass_prop)
+) +
+  geom_col(width = 0.6) +
+  geom_text(
+    aes(label = paste0(
+      percent(reclass_prop, accuracy = 0.1),
+      "\n(n = ", n, ")"
+    )),
+    vjust = -0.2,
+    size = 3.5
+  ) +
+  scale_y_continuous(
+    labels = percent,
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "Reclassification by Within-Person SBP Variability",
+    x = "SBP variability group",
+    y = "Reclassification proportion"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_variability
+ggsave("outputs/week6_reclassification_by_variability.png", p_variability,
+       width = 7, height = 5, bg = "white")
+```
+
+## 5.7 Optional challenge: compare Trial 1, mean, and median
+
+```{r strategy-comparison}
+```
+
+
+```{r strategy-comparison}
+```
+
+
+```{r strategy-comparison}
+strategy_comparison <- bp_class_data %>%
+  filter(
+    !is.na(category_trial1),
+    !is.na(category_mean),
+    !is.na(category_median)
+  ) %>%
+  summarise(
+    n = n(),
+    trial1_vs_mean = sum(category_trial1 != category_mean),
+    trial1_vs_median = sum(category_trial1 != category_median),
+    mean_vs_median = sum(category_mean != category_median)
+  )
+
+knitr::kable(
+  strategy_comparison,
+  caption = "Pairwise classification changes across measurement strategies"
+)
+```
+
+## 5.8 Week 6 conclusion
+
+Complete the statements after reviewing the results:
+
+1. The population-level distributions across the three BP trials appeared  similar.
+2. Individual participants showed little within-person variation in repeated BP readings.
+3. Using the mean of repeated readings instead of Trial 1 alone reclassified **`r if (exists("reclass_summary")) sprintf("%.1f%%", reclass_summary$reclass_percent) else "X%"`** of participants with valid classifications under both strategies.
+4. Reclassification was more common among participants with higher within-person SBP variability.
+5. These descriptive results suggest that using a single reading rather than repeated measurements can change BP category for some participants. The analysis is descriptive and does not establish that one strategy is universally superior.
+
+# 6. Output files
+
+The figures are saved in the `outputs` folder:
+
+- `week5_bmi_before.png`
+- `week5_bmi_after.png`
+- `week5_bmi_missingness.png`
+- `week5_sbp_before_after.png`
+- `week5_bmi_sbp_missingness.png`
+- `week5_bmi_sbp_scatter_by_sex.png`
+- `week6_raw_bp_trial_boxplots.png`
+- `week6_raw_sbp_change_histogram.png`
+- `week6_raw_sbp_spaghetti.png`
+- `week6_bp_classification_heatmap.png`
+- `week6_reclassification_by_variability.png`
+
+# 7. Reproducibility notes
+
+- The analysis uses the NHANES August 2021–August 2023 files `DEMO_L.XPT`, `BMX_L.XPT`, and `BPXO_L.XPT`.
+- Update `data_dir` in Section 1.1 to match the folder on your computer.
+- The Week 5 cleaning rules can create additional missing values. All Week 6 cleaned-reading analyses therefore depend on those rules.
+- This report uses descriptive summaries and plots; no formal hypothesis tests are required by the lab instructions.
